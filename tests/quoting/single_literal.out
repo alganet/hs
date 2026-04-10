@@ -1,0 +1,3 @@
+$x is literal
+no expansion: $(date)
+with spaces    preserved

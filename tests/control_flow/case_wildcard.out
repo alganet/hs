@@ -1,0 +1,4 @@
+file.txt: text
+hello.c: source
+script.sh: shell
+readme: other

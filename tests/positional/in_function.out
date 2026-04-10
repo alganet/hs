@@ -1,0 +1,5 @@
+fn1: inner1
+fn2: inner2
+fn#: 3
+after1: outer1
+after#: 2

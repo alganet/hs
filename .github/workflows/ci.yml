@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: 2026 Alexandre Gomes Gaigalas <alganet@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc
+            deps: ''
+            build: ./build.sh --gcc
+            shell: ./build/hs-gcc
+          - name: tcc
+            deps: tcc
+            build: ./build.sh --tcc
+            shell: ./build/hs-tcc
+          - name: m2-planet
+            deps: ''
+            build: ./build.sh
+            shell: ./build/hs
+          - name: oracle
+            deps: ''
+            build: ''
+            shell: /bin/sh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        if: matrix.deps != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.deps }}
+
+      - name: Cache stage0-posix toolchain
+        if: matrix.name == 'm2-planet'
+        uses: actions/cache@v4
+        with:
+          path: |
+            stage0-posix-1.9.1
+            stage0-posix-1.9.1.tar.gz
+          key: stage0-posix-1.9.1-amd64
+
+      - name: Build
+        if: matrix.build != ''
+        run: ${{ matrix.build }}
+
+      - name: Test
+        run: ${{ matrix.shell }} tests/run.sh --target ${{ matrix.shell }}
+
+  sanitizers:
+    name: sanitizers (asan+ubsan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build with ASan + UBSan
+        run: |
+          mkdir -p build
+          gcc -fsanitize=address,undefined -fno-sanitize-recover=all \
+              -fno-omit-frame-pointer -O1 -g \
+              -o build/hs-san hs.c bootstrappable.c
+
+      - name: Run tests under sanitizers
+        env:
+          ASAN_OPTIONS: abort_on_error=1:halt_on_error=1:detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ./build/hs-san tests/run.sh --target ./build/hs-san
