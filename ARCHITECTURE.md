@@ -23,16 +23,16 @@ seed.
 
 Each command runs through:
 
-1. **Lexer**: [hs.c:1452 lex_tokenize](../hs.c#L1452) walks the input
+1. **Lexer**: [hs.c:2007 lex_tokenize](../hs.c#L2007) walks the input
    string and produces an array of tokens. The tokenizer is one-shot:
    it consumes the entire input up front before parsing starts.
 2. **Parser**: recursive-descent functions in
-   [hs.c:1889-2456](../hs.c#L1889-L2456) consume the token stream and
+   [hs.c:2491-3340](../hs.c#L2491-L3340) consume the token stream and
    build an AST in the node arrays (`nd_type`, `nd_a`, `nd_b`, `nd_c`,
    `nd_d`, `nd_str`, `nd_argv`, `nd_assigns`).
-3. **Executor**: [hs.c:5378 exec_node](../hs.c#L5378) walks the AST
+3. **Executor**: [hs.c:7684 exec_node](../hs.c#L7684) walks the AST
    and runs each node. Simple commands route through
-   [hs.c:4819 exec_simple](../hs.c#L4819).
+   [hs.c:6765 exec_simple](../hs.c#L6765).
 
 The same three stages run for the top-level script, for `eval`, for
 `source`, and for command substitution `$(...)`. They are reentered via
@@ -59,11 +59,11 @@ To emulate pipes, hs:
 3. The parent waits for the child, then reads the file back and
    splices it into the next stage.
 
-[hs.c:599 make_cap_tmpfile_path](../hs.c#L599) is the temp-file
+[hs.c:706 make_cap_tmpfile_path](../hs.c#L706) is the temp-file
 allocator. It uses `O_CREAT | O_EXCL | HS_O_NOFOLLOW` with mode 0600
 and retries on `EEXIST`, so a local attacker can't win the classic
 symlink-attack against a predictable filename. `HS_O_NOFOLLOW` is
-defined locally in [hs.c:36](../hs.c#L36) because M2libc's `fcntl.c`
+defined locally in [hs.c:47](../hs.c#L47) because M2libc's `fcntl.c`
 doesn't expose it.
 
 The downsides are real and intentional:
@@ -77,15 +77,28 @@ If you find yourself wanting `dup2`, stop and check whether the
 behavior can be emulated with the existing primitives. The whole
 redirection layer is built around this restriction.
 
+Two application details worth knowing. First, a target that `open()`
+can't satisfy (`> /nonexistent/out`, `< missing`) **aborts the command**
+with a nonzero status and `hs: cannot open redirect target: <path>`,
+rather than silently running it against the inherited fd — this is what
+makes `set -e` and autoconf probes like `: > conftest` behave. Second,
+input fd duplication `N<&M` (e.g. `exec 7<&0`) mirrors output `N>&M`.
+Both forms are applied in **two parallel redirect loops** that must stay
+in sync: the one inline in `exec_simple` (simple commands; it also
+builds the child-side spec so a forked external inherits the dup) and
+the one in `exec_redir` (redirected compound groups, `{ ...; } > file`).
+hs tracks only fds 0/1/2, so a dup whose source/target is fd ≥3 is a
+graceful no-op. When you touch redirect handling, change both loops.
+
 ## Two allocators
 
 hs uses two custom allocators on top of `calloc`/`free`:
 
-- **Persistent pool** ([hs.c:85 perm_init](../hs.c#L85),
+- **Persistent pool** ([hs.c:113 perm_init](../hs.c#L113),
   `perm_alloc`, `perm_dup`): an 8 MB bump allocator that survives
   across commands. Function-definition AST nodes and persistent
   function bodies live here.
-- **Temporary arena** ([hs.c:123 tmp_init](../hs.c#L123),
+- **Temporary arena** ([hs.c:185 tmp_init](../hs.c#L185),
   `tmp_alloc`, `tmp_reset`): a 32 MB bump allocator that gets reset
   between commands so per-command scratch (expansion buffers, parsed
   tokens, etc.) doesn't leak across statements.
@@ -96,12 +109,10 @@ forever within a script run. Code that needs to survive arena resets
 either uses `perm_alloc` or escapes via `calloc`/`free` directly.
 
 `str_dup`, `tmp_dup`, `tmp_cat2`, and `tmp_cat3` are convenience
-wrappers. The bounds-checked safe-string helpers (`str_cpy_safe`,
-`str_cat_safe`, `buf_putc`, `out_put`, `out_puts`, `lex_put`) live in
-[hs.c:155-265](../hs.c#L155-L265) and exist because hs has many
-fixed-size buffers that historically called `strcpy`/`strcat` with no
-length check. Wrapping every such call site in these helpers turns
-silent overflows into loud `require()` errors.
+wrappers. The bounds-checked buffer helpers (`out_put`, `out_puts`,
+`lex_put`) exist because hs has many fixed-size buffers; routing writes
+through a helper — or a direct `require(i < CAP, ...)` before the store —
+turns a silent overflow into a loud `require()` error.
 
 ## Quoting via sentinel bytes
 
@@ -116,7 +127,7 @@ Q_DQ_CLOSE = 0x04   double-quote close
 Q_SPLIT    = 0x05   word-split marker (from unquoted IFS expansions)
 ```
 
-(Definitions in [hs.c around line 70](../hs.c#L70).)
+(Definitions in [hs.c around line 97](../hs.c#L97).)
 
 These sentinels let `expand_word`, `pat_match`, and `case_match` know
 which characters were originally quoted without keeping a parallel
@@ -132,9 +143,9 @@ don't collide with anything `expand_word` produces.
 ## Hard limits
 
 These are baked into the source as `#define`s in
-[hs.c:21-32](../hs.c#L21-L32) and
-[hs.c:584](../hs.c#L584). Each one is checked at runtime via
-`require()`; hitting any limit aborts with a specific error message.
+[hs.c:21-77](../hs.c#L21-L77) and
+[hs.c:657](../hs.c#L657). Most are checked at runtime via
+`require()`; hitting such a limit aborts with a specific error message.
 
 | Constant         | Value   | What it bounds                                                                    | Tripped error                                                                                                          |
 |------------------|---------|-----------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------|
@@ -146,10 +157,15 @@ These are baked into the source as `#define`s in
 | `MAX_FN`         | 4 096   | Live function definitions                                                         | `fn_set: too many functions`                                                                                           |
 | `MAX_AL`         | 2 048   | Live aliases                                                                      | `al_set: too many aliases`                                                                                             |
 | `MAX_LOCAL`      | 4 096   | Total local-scope slots across the call stack                                     | `lsc_declare: overflow`                                                                                                |
-| `MAX_ARGV`       | 1 024   | argv length per command                                                           | (clamps in `expand_argv`)                                                                                              |
+| `MAX_ARGV`       | 1 024   | argv length per command; argv/assign slots in `parse_simple`                      | `hs: too many arguments` / `hs: too many assignments`; field-split expansion clamps in `expand_argv`                   |
 | `MAX_DEPTH`      | 256     | Local-scope nesting; parser recursion; expansion recursion; `pat_match` recursion | `lsc_push: too deep`, `hs: nested commands too deep`, `hs: expansion nested too deep`, `hs: pattern too deeply nested` |
 | `TMP_SIZE`       | 32 MiB  | Temporary arena size                                                              | (clamps; oldest scratch is reused)                                                                                     |
 | `LEX_STACK_MAX`  | 64      | Alias-expansion recursion depth                                                   | (silently caps; recursive aliases stop)                                                                                |
+
+`MAX_STR` bounds individual lexer words and expansion atoms, but **not**
+command-substitution output: `$(...)` is captured into a buffer that
+grows on demand (double-and-copy), so a `$(find ...)` larger than 8 KB is
+spliced whole.
 
 When you raise one of these, raise it for a reason: most of them are
 small because the bootstrap target has tight memory and no swap.
@@ -165,13 +181,13 @@ first byte of `fn_bodies[i]`:
 - **Persistent (AST-form)**: set when a function is defined at the
   top level of a script being run via `exec_source`. The body stores
   `"\x02<ast-node-index>"`. Calling the function jumps to
-  [hs.c:5378 exec_node](../hs.c#L5378) at the stored index. The AST
+  [hs.c:7684 exec_node](../hs.c#L7684) at the stored index. The AST
   itself lives in the persistent pool.
 - **Eval-defined (string-form)**: set when a function is defined
   inside `eval`, `.`/`source` of a string, command substitution, or
   any other reentrant parse. The body stores the source text of the
   function body (the `{ ... }` slice extracted from the eval'd
-  source. See [parse_simple in hs.c around line 2300](../hs.c#L2300)).
+  source. See [parse_simple in hs.c around line 3031](../hs.c#L3031)).
   Calling the function re-tokenizes and re-parses that text via
   `expand_and_exec`.
 
@@ -179,7 +195,7 @@ The string-form has a subtlety: when the eval'd function is called,
 the parser re-runs the function definition from the body string. That
 re-definition must be a no-op rather than a "rotate" (free old, install
 new), because `lex_orig_src` aliases the slot's current contents.
-[hs.c:911 fn_replace_body](../hs.c#L911) detects the
+[hs.c:1066 fn_replace_body](../hs.c#L1066) detects the
 `fn_bodies[i] == body` self-aliased case and returns without touching
 the slot. This is the single non-obvious invariant in the function
 table; without it, calling an eval-defined function frees the source
@@ -190,7 +206,7 @@ A second subtlety: the body string stores **just the brace group**
 context would re-execute everything around the function on every call,
 which infinite-recurses if the surrounding context contains a call to
 the same function. The slicing happens in
-[parse_simple](../hs.c#L2300) using `tok_src_start[]` to find the body
+[parse_simple](../hs.c#L3031) using `tok_src_start[]` to find the body
 range and `memcpy` to copy it out.
 
 The tests in
@@ -200,7 +216,7 @@ loop, unset).
 
 ## Parser error diagnostics
 
-Parser errors go through [hs.c:1800 parse_err](../hs.c#L1800), which
+Parser errors go through [hs.c:2415 parse_err](../hs.c#L2415), which
 reports `hs: <path>:<line>:<col>: <msg>` and a snippet of the offending
 line with a caret. The line number is global to the script: hs's
 `exec_source` chops the script into per-command chunks and parses each
@@ -237,8 +253,61 @@ CI exercises all four target builds plus an oracle run against
 `/bin/sh`, plus a sanitizer build (`gcc -fsanitize=address,undefined`)
 in [.github/workflows/ci.yml](../.github/workflows/ci.yml). The
 sanitizer job is the most useful one for catching regressions in the
-buffer-handling, recursion, and ownership code added to hs after the
-initial commit.
+buffer-handling, recursion, and ownership code.
+
+## M2-Planet portability constraints
+
+The M2-Planet target compiles a strict C subset and links against
+M2libc, so `hs.c` avoids several things the other compilers accept:
+
+- **No `?:` ternary** — write it as `if`/`else`.
+- **No static globals with initializers and no local arrays** — globals
+  are bare pointers `calloc`'d in `main`/`*_init`; scratch comes from the
+  `tmp` arena (`tmp_alloc`). Even a local `char buf[N]` has corrupted the
+  stack under M2-Planet; use a heap/arena buffer instead.
+- **Pointer arithmetic on multi-byte element types is NOT scaled.** For a
+  `char**` (or `int*`, etc.) both `p + 1` and `&p[1]` advance by *one byte*,
+  not one element — only the rvalue index `p[i]` is scaled correctly. So
+  `execve(path, argv + 1, envp)` passes a misaligned argv and fails. Shift an
+  argv by building a fresh array through indexing instead (`argv_drop`). This
+  one is nasty because `p[i]` reads fine, so the type looks healthy until you
+  do explicit arithmetic on it.
+- **`&&` and `||` are NOT short-circuited** — M2-Planet evaluates *both*
+  operands every time, so a single condition behaves differently under M2
+  than under gcc/tcc. Two rules follow. (1) If the right operand is unsafe
+  when the left short-circuits, split it: `while (b >= 0 && strcmp(results[b],
+  x) > 0)` dereferences `results[-1]` once `b` hits `-1` under M2, so write
+  `while (b >= 0) { if (strcmp(results[b], x) <= 0) break; ... }`. (2) If the
+  right operand has a side effect the program needs (e.g. a parser call that
+  advances a cursor), evaluate it into a temp first so it always runs:
+  `int r = f(); left = bool_to_int(left && r);` — otherwise gcc/tcc skip it.
+- **No inline asm, no raw syscall numbers, no struct offsets.** Every kernel
+  interaction goes through a plain M2libc wrapper
+  (`open`/`read`/`write`/`close`/`lseek`/`fork`/`execve`/`waitpid`/`access`/
+  `chdir`/`getcwd`/`unlink`/`exit`, plus `brk` under `calloc`), so one source
+  compiles and runs on any M2-Planet target — `./build.sh --arch riscv64` (or
+  `aarch64`) cross-builds an ELF that runs under qemu-user. The only `#ifndef
+  __M2__` left is the `<sys/wait.h>` include, a hosted-vs-M2libc header choice,
+  not architecture-specific.
+
+  Two shell features need kernel calls M2libc doesn't wrap, so hs does without
+  them:
+  - **No filename globbing.** Listing a directory needs `getdents64`, which has
+    no portable libc form, so `*`, `?`, `[` are literal in word context (as if
+    `set -f` were always on; `set -f`/`+f` are accepted but inert). Pattern
+    matching in `case` and `${v#pat}`/`${v%pat}` is unaffected — that is pure
+    string matching (`pat_match`), no syscalls.
+  - **No `-L`/`-h` symlink test** (needs `lstat`); both answer false.
+
+  The file-type tests share one probe (`path_probe`): `open(O_NONBLOCK)` + a
+  1-byte `read`. `-f` is read `>= 0` (a readable file), `-d` is read `< 0` (a
+  directory fd fails `read` with `EISDIR`), `-s` is read `>= 1` (non-empty) — one
+  `open` feeds all three. `-e`/`-r`/`-w`/`-x` use `access`. The probe can't
+  classify an unreadable file (open fails → `-f`/`-d` false) or reliably tell a
+  FIFO/device from a directory (`EAGAIN` reads like `EISDIR`); those need stat.
+  (`lseek` is used only to re-sync a redirected fd to EOF after an external wrote
+  to the same file through its own fd, so a later builtin write in
+  `{ echo A; echo X | sed …; echo B; } > f` doesn't overwrite it.)
 
 ## Test layout
 
@@ -262,20 +331,22 @@ require non-oracle behavior aren't supported by the framework.
 
 ## Where things live (quick reference)
 
-- Memory allocators: [hs.c:85-150](../hs.c#L85-L150)
-- Bounds-checked buffer helpers: [hs.c:155-265](../hs.c#L155-L265)
-- Variable store: [hs.c:697-880](../hs.c#L697-L880)
-- Function table: [hs.c:887-960](../hs.c#L887-L960)
-- Lexer: [hs.c:1143-1700](../hs.c#L1143-L1700)
-- Parser error machinery: [hs.c:1760-1855](../hs.c#L1760-L1855)
-- Recursive-descent parser: [hs.c:1889-2456](../hs.c#L1889-L2456)
-- Pattern matching: [hs.c:2488-2620](../hs.c#L2488-L2620)
-- Arithmetic evaluator: [hs.c:2630-3050](../hs.c#L2630-L3050)
-- `expand_word`: [hs.c:3146-3680](../hs.c#L3146-L3680)
-- Builtins: [hs.c:3679-4800](../hs.c#L3679-L4800)
-- `exec_simple`: [hs.c:4819-5375](../hs.c#L4819-L5375)
-- `exec_node`: [hs.c:5378-5660](../hs.c#L5378-L5660)
-- `main`: [hs.c:5664](../hs.c#L5664)
+- Memory allocators: [hs.c:110-260](../hs.c#L110-L260)
+- Buffer helpers (`out_put`/`out_puts`/`lex_put`): [hs.c:200-660](../hs.c#L200-L660)
+- Temp-file allocator (`make_cap_tmpfile_path`): [hs.c:706](../hs.c#L706)
+- Variable store: [hs.c:760-1040](../hs.c#L760-L1040)
+- Function table: [hs.c:1000-1100](../hs.c#L1000-L1100)
+- Lexer: [hs.c:1300-2200](../hs.c#L1300-L2200)
+- Parser error machinery: [hs.c:2415-2490](../hs.c#L2415-L2490)
+- Recursive-descent parser: [hs.c:2491-3340](../hs.c#L2491-L3340)
+- Pattern matching: [hs.c:3220-3400](../hs.c#L3220-L3400)
+- Arithmetic evaluator: [hs.c:3405-3810](../hs.c#L3405-L3810)
+- `expand_word`: [hs.c:4007-4930](../hs.c#L4007-L4930)
+- Builtins: [hs.c:4931-6700](../hs.c#L4931-L6700)
+- `exec_simple`: [hs.c:6765-7460](../hs.c#L6765-L7460)
+- `exec_redir` (compound-group redirects): [hs.c:7495-7680](../hs.c#L7495-L7680)
+- `exec_node`: [hs.c:7684-8050](../hs.c#L7684-L8050)
+- `main`: [hs.c:8061](../hs.c#L8061)
 
 These ranges drift as the file evolves; treat them as starting points,
 not pinned addresses.
