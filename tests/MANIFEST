@@ -19,6 +19,9 @@ tests/builtins/test_string_ne.sh
 tests/builtins/test_string_empty.sh
 tests/builtins/test_numeric.sh
 tests/builtins/test_logical.sh
+tests/builtins/umask.sh
+tests/builtins/trap_exit_subshell.sh
+tests/builtins/exec_args.sh
 tests/builtins/bracket_syntax.sh
 tests/builtins/exit_zero.sh
 tests/builtins/exit_default.sh
@@ -61,6 +64,7 @@ tests/control_flow/brace_group.sh
 tests/control_flow/negation.sh
 tests/control_flow/andor_chain.sh
 tests/control_flow/semicolon_list.sh
+tests/control_flow/comment_paren.sh
 
 # --- expansion ---
 tests/expansion/var_simple.sh
@@ -78,6 +82,7 @@ tests/expansion/arith_add.sh
 tests/expansion/arith_precedence.sh
 tests/expansion/arith_compare.sh
 tests/expansion/arith_logical.sh
+tests/expansion/arith_logical_chain.sh
 tests/expansion/arith_bitwise.sh
 tests/expansion/arith_shift.sh
 tests/expansion/arith_ternary.sh
@@ -90,6 +95,7 @@ tests/expansion/cmd_subst_nested.sh
 tests/expansion/cmd_subst_external.sh
 tests/expansion/cmd_subst_external_multi.sh
 tests/expansion/cmd_subst_external_assign.sh
+tests/expansion/pattern_escape_strip.sh
 
 # --- quoting ---
 tests/quoting/single_literal.sh
@@ -118,12 +124,17 @@ tests/redirection/append_and_dup.sh
 tests/redirection/dup_trap_form.sh
 tests/redirection/dup_external_merge.sh
 tests/redirection/dup_external_trap.sh
+tests/redirection/group_pipe_resync.sh
+tests/redirection/redir_target_split.sh
+tests/redirection/fd_redirect_spacing.sh
+tests/redirection/input_dup.sh
 
 # --- pattern matching ---
 tests/pattern_matching/star.sh
 tests/pattern_matching/question.sh
 tests/pattern_matching/charclass.sh
 tests/pattern_matching/range.sh
+tests/pattern_matching/bracket_close.sh
 tests/pattern_matching/middle_wild.sh
 
 # --- aliases ---
@@ -139,6 +150,8 @@ tests/set_flags/nounset_errors.sh
 tests/set_flags/set_positional.sh
 tests/set_flags/set_toggle.sh
 tests/set_flags/set_efu.sh
+tests/set_flags/errexit_andor.sh
+tests/set_flags/errexit_andor_boundary.sh
 
 # --- errors ---
 tests/errors/exit_42.sh
@@ -146,6 +159,7 @@ tests/errors/bad_cd.sh
 tests/errors/missing_cmd.sh
 tests/errors/exit_nonzero.sh
 tests/errors/exit_on_false.sh
+tests/errors/subshell_signal.sh
 
 # --- positional ---
 tests/positional/all_positional.sh
@@ -159,3 +173,23 @@ tests/integration/arg_parser.sh
 tests/integration/env_probe.sh
 tests/integration/wordcount.sh
 tests/integration/string_builder.sh
+
+# --- heredoc ---
+tests/heredoc/basic.sh
+tests/heredoc/expand.sh
+tests/heredoc/literal_squote.sh
+tests/heredoc/literal_dquote.sh
+tests/heredoc/escapes.sh
+tests/heredoc/dash_strip.sh
+tests/heredoc/dash_strip_literal.sh
+tests/heredoc/multi.sh
+tests/heredoc/pipe.sh
+tests/heredoc/redirect_combo.sh
+tests/heredoc/in_for.sh
+tests/heredoc/in_if.sh
+tests/heredoc/in_while.sh
+tests/heredoc/in_function.sh
+tests/heredoc/empty_body.sh
+tests/heredoc/no_split.sh
+tests/heredoc/inner_quotes.sh
+tests/heredoc/backtick_subst.sh

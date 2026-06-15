@@ -1,0 +1,7 @@
+in-subshell
+subshell rc=7
+clean subshell rc=0
+cmdsub got=[]
+marker survived
+end-of-script
+PARENT_EXIT

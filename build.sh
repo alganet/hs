@@ -28,15 +28,34 @@ for tool in "$M2" "$M1" "$HEX2" "$BLOOD"; do
     fi
 done
 
-# Parse flags
+# Parse flags. --arch <name> cross-compiles via M2-Planet for a little-endian
+# 64-bit M2libc target (amd64 default, riscv64, aarch64); the host
+# M2-Planet/M1/hex2 tools target it via --architecture, with the --64 and
+# --little-endian flags below hardcoded for that class. Cross outputs go to
+# build/hs-<arch> so build/hs (amd64) is never clobbered.
 CC=""
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
     --gcc)     CC="gcc";;
     --tcc)     CC="tcc";;
     --chibicc) CC="chibicc";;
+    --arch)
+        if [ $# -lt 2 ] || [ -z "$2" ]; then
+            echo "build.sh: --arch requires an architecture name (e.g. riscv64, aarch64)" >&2
+            exit 2
+        fi
+        ARCH="$2"; shift;;
+    --arch=*)
+        ARCH="${1#--arch=}"
+        if [ -z "$ARCH" ]; then
+            echo "build.sh: --arch= requires a non-empty architecture name" >&2
+            exit 2
+        fi;;
     esac
+    shift
 done
+BIN="hs"
+test "$ARCH" = "amd64" || BIN="hs-${ARCH}"
 
 # Standard compiler path (GCC, tcc, chibicc)
 if test -n "$CC"; then
@@ -75,29 +94,29 @@ echo "==> M2-Planet: compiling hs.c"
     -f "${M2LIBC}/bootstrappable.c" \
     -f "${SRCDIR}/hs.c" \
     --debug \
-    -o "${OUTDIR}/hs.M1"
+    -o "${OUTDIR}/${BIN}.M1"
 
 echo "==> blood-elf: generating debug stubs"
 "$BLOOD" --64 --little-endian \
-    -f "${OUTDIR}/hs.M1" \
-    -o "${OUTDIR}/hs-footer.M1"
+    -f "${OUTDIR}/${BIN}.M1" \
+    -o "${OUTDIR}/${BIN}-footer.M1"
 
 echo "==> M1: assembling"
 "$M1" --architecture ${ARCH} \
     --little-endian \
     -f "${M2LIBC}/${ARCH}/${ARCH}_defs.M1" \
     -f "${M2LIBC}/${ARCH}/libc-full.M1" \
-    -f "${OUTDIR}/hs.M1" \
-    -f "${OUTDIR}/hs-footer.M1" \
-    -o "${OUTDIR}/hs.hex2"
+    -f "${OUTDIR}/${BIN}.M1" \
+    -f "${OUTDIR}/${BIN}-footer.M1" \
+    -o "${OUTDIR}/${BIN}.hex2"
 
 echo "==> hex2: linking"
 "$HEX2" --architecture ${ARCH} \
     --little-endian \
     --base-address 0x00600000 \
     -f "${M2LIBC}/${ARCH}/ELF-${ARCH}-debug.hex2" \
-    -f "${OUTDIR}/hs.hex2" \
-    -o "${OUTDIR}/hs"
+    -f "${OUTDIR}/${BIN}.hex2" \
+    -o "${OUTDIR}/${BIN}"
 
-chmod 755 "${OUTDIR}/hs"
-echo "==> Built: ${OUTDIR}/hs"
+chmod 755 "${OUTDIR}/${BIN}"
+echo "==> Built: ${OUTDIR}/${BIN}"

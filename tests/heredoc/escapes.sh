@@ -1,0 +1,4 @@
+x=VAL
+cat <<EOF
+d \$x \\ \` \" $x
+EOF

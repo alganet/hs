@@ -11,7 +11,10 @@ build under [M2-Planet](https://github.com/oriansj/M2-Planet) without
 depending on libc features that early bootstrap kernels can't provide.
 
 `hs` is not super fast, not super secure, not super comprehensive. Its
-goal is to build with a very limited set of dependencies.
+goal is to build from a very limited set of dependencies and run on small
+kernels. It uses no inline assembly and no architecture-specific code —
+only plain libc/syscall wrappers — so one source builds for any M2-Planet
+target (x86, amd64, riscv64, aarch64, …) via `./build.sh --arch <arch>`.
 
 ## Building
 
@@ -59,23 +62,40 @@ escapes.
 ### Redirection
 
 `>`, `>>`, `<`, `2>`, `2>>`, explicit fd prefixes `N> file` / `N< file`,
-fd duplication `N>&M` (e.g. `2>&1`, `1>&2`), including the trap form
-`2>&1 > out`.
+fd duplication `N>&M` and `N<&M` (e.g. `2>&1`, `1>&2`, `exec 7<&0`),
+including the trap form `2>&1 > out`. Redirection also works on compound
+groups (`{ ...; } > file`). A redirection whose target can't be opened
+fails the command with a nonzero status instead of running it anyway.
 
-### Pattern matching (in `case`)
+### Heredocs
 
-`*`, `?`, `[abc]`, `[a-z]`.
+`<<WORD` and `<<-WORD` (the dash form strips leading tabs). A quoted
+delimiter (`<<'EOF'`) makes the body literal; an unquoted one expands
+`$var`, `$(...)`, and backticks.
+
+### Pattern matching (in `case` and `${v#pat}`/`${v%pat}`)
+
+`*`, `?`, `[abc]`, `[a-z]`, `[!abc]` (negation); a leading `]` in a
+class (`[]ab]`) is a literal member, per POSIX. This is **string** matching
+only — see below; `*`/`?`/`[` are *not* expanded against filenames.
 
 ### Missing by design
 
-Heredocs, process substitution, job control, `$LINENO`, `$FUNCNAME`,
-arrays, `$(< file)`, `$10+` positional params, interactive-mode
-features, redirection on brace/subshell groups (e.g. `{ ...; } > file`).
+Process substitution, job control, `$LINENO`, `$FUNCNAME`, arrays,
+`$(< file)`, `$10+` positional params, and interactive-mode features.
+
+**Filename globbing** is absent: `*`, `?`, `[` stay literal in word
+context, as if `set -f` were always on (`set -f`/`+f` are accepted but
+inert). Pattern matching in `case` and `${v#pat}` still works — that is
+string matching, not filename expansion. The **`-L`/`-h`** symlink tests
+are always false; the other file tests
+(`-f`/`-d`/`-s`/`-e`/`-r`/`-w`/`-x`) work.
+
 The shell is deliberately small.
 
 ## How piping/redirection works
 
-All three build variants use the same strategy for redirection: no
+All builds use the same strategy for redirection: no
 `pipe()`, no `dup()`, no `dup2()`, no `/proc/self/fd`, no `mknod`.
 The only syscalls involved are `open`, `close`, `read`, `write`,
 `fork`, `execve`, and `waitpid`, used to emulate redirection features
