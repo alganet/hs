@@ -307,15 +307,6 @@ char* tmp_cat3(char* a, char* b, char* c)
 	return tmp_cat2(tmp_cat2(a, b), c);
 }
 
-/* Redirection spec kinds passed from exec_simple to exec_external_redir.
- *   REDIR_NONE    inherit the parent's fd, no action.
- *   REDIR_PATH    close(N) + open(path, mode) in the child.
- *   REDIR_CAPTURE same as PATH, plus a post-waitpid replay from the
- *                 tmp file to replay_fd in the parent. */
-#define REDIR_NONE    0
-#define REDIR_PATH    1
-#define REDIR_CAPTURE 2
-
 /* Translate a waitpid() status into a shell exit status. A normally-exited
    child yields its exit code (high byte); a child killed by a signal yields
    128 + signal number (the low 7 bits), matching POSIX/dash/bash. Without the
@@ -329,7 +320,14 @@ int wait_status_to_exit(int status)
 	return (status >> 8) & 255;
 }
 
-/* External command execution. */
+/* External command execution. hs never redirects or captures an external
+ * program's stdio: on the target kernels fd 0/1/2 are the console
+ * unconditionally and there is no dup2, so an exec'd program's output cannot
+ * be repointed (KERNEL.md K1). Redirection/capture is a builtin-only feature;
+ * externals always run with the fds they inherit. So this is a plain
+ * fork+exec -- the child keeps hs's fd table (no CLOEXEC, harmless for a
+ * bootstrap shell, and closing fds in the child would corrupt the parent
+ * across the kernels' shared-fd-table fork anyway). */
 int exec_external(char* path, char** argv, char** envp)
 {
 	int child;
@@ -341,74 +339,6 @@ int exec_external(char* path, char** argv, char** envp)
 		_exit(127);
 	}
 	waitpid(child, &status, 0);
-	return wait_status_to_exit(status);
-}
-
-/* External command with child-process redirections. The child uses
- * close(N)+open() to land a fresh fd at slot N (since open() returns
- * the lowest unused fd). For REDIR_CAPTURE slots the parent also
- * reads the tmp file back and writes it to replay_fd[i] after
- * waitpid. Co-captured slots share a single path allocation, marked
- * by shares_path[i]; replay and free happen only on the owning slot. */
-int exec_external_redir(char* path, char** argv, char** envp,
-                        int* kind, char** paths, int* modes,
-                        int* replay_fd, int* shares_path)
-{
-	int child;
-	int status;
-	int fd;
-	int i;
-	child = fork();
-	if(child == 0)
-	{
-		i = 0;
-		while(i < 3)
-		{
-			if(kind[i] != REDIR_NONE)
-			{
-				close(i);
-				fd = open(paths[i], modes[i], 420);
-				/* open() returns the lowest free fd; after close(i) that is i
-				   only if all fds below i are open. If an inherited lower fd was
-				   closed, the target lands at the wrong slot -- fail rather than
-				   misdirect the child's stdio. */
-				if(fd != i) _exit(1);
-			}
-			i = i + 1;
-		}
-		execve(path, argv, envp);
-		_exit(127);
-	}
-	waitpid(child, &status, 0);
-
-	/* Replay captured slots to their replay target. */
-	i = 0;
-	while(i < 3)
-	{
-		if(kind[i] == REDIR_CAPTURE && shares_path[i] == 0)
-		{
-			int rfd;
-			int n;
-			char* buf;
-			/* Arena, not `char buf[4096]`: M2-Planet mishandles local
-			   arrays and corrupts the stack frame. */
-			buf = tmp_alloc(4096);
-			rfd = open(paths[i], O_RDONLY, 0);
-			if(rfd >= 0)
-			{
-				n = read(rfd, buf, 4096);
-				while(n > 0)
-				{
-					write(replay_fd[i], buf, n);
-					n = read(rfd, buf, 4096);
-				}
-				close(rfd);
-			}
-			unlink(paths[i]);
-			free(paths[i]);
-		}
-		i = i + 1;
-	}
 	return wait_status_to_exit(status);
 }
 
@@ -586,6 +516,15 @@ int    fn_return_flag;
 int    loop_break_level;
 int    loop_continue_flag;
 int    in_function;
+/* In-process subshell execution. hs runs `( )`, `$( )` and pipe stages without
+ * fork-without-exec (the builder-hex0-arch kernels do not restore a parent that
+ * forked and then exited without execve -- see KERNEL.md K1), so a subshell body
+ * runs in the same process under run_isolated(). subshell_depth > 0 means we are
+ * inside such a body; an `exit` then unwinds via g_subshell_exit (like
+ * fn_return_flag) instead of terminating the whole shell. */
+int    subshell_depth;
+int    g_subshell_exit;
+int    g_subshell_exit_status;
 char*  cached_ifs;
 char** global_envp;
 /* Action registered for the EXIT pseudo-signal via `trap`, or NULL.
@@ -598,6 +537,15 @@ char*  trap_exit_action;
  * as an implicit `< file` redirect. */
 char*  pending_pipe_stdin_file;
 int    tmp_counter;
+
+/* Last value handed to `umask`. The minimal kernels have no umask syscall
+ * (it is not one of the ~18 they dispatch; an unknown syscall returns -1 on
+ * aarch64/riscv64 and 0 on x86), so calling umask(0) to *read* the mask would
+ * print arch-dependent garbage. We track the value ourselves instead: the set
+ * form records it here (and still calls umask() for the POSIX host, where it
+ * works), the print form reports it. Default 022 matches a typical shell. See
+ * KERNEL.md. */
+int    g_umask;
 
 /* Lexer state for reentrant parsing */
 char*  lex_src;
@@ -653,6 +601,7 @@ int exec_buffer(char* buf, int len, char* path);
 void parse_init(char* input);
 int parse_list();
 int expand_and_exec(char* code);
+int run_isolated(int node_idx, char* expr, int out_fd, char* out_path);
 
 /* Fork-based output capture for $(cmd) and CMD_PIPE left-side.
  * Fork a child, redirect its fd 1 to a fresh /tmp/hs-cap-<n> via
@@ -697,74 +646,59 @@ char* make_cap_tmpfile_path()
 	}
 }
 
-/* Child-side setup for a command substitution: redirect stdout to `tmpfile`
-   and reset the shell's fd/path state so the captured body runs with a clean
-   stdout (hs_out_path = tmpfile lets a nested `2>&1` resolve via path-reopen).
-   Returns the opened fd, or -1 on failure (the caller then _exit(1)s). A
-   command substitution body is its own command context, so field splitting is
-   re-enabled even when the enclosing expansion suppressed it (e.g. `x=$(cmd)`:
-   the assignment RHS runs unsplit, but commands inside still split), and the
-   parent's EXIT trap must not fire in the child. */
-int cap_child_setup(char* tmpfile)
+/* Open a path for append (`>>`). Some kernels ignore O_APPEND and, worse, make
+   O_CREAT allocate a fresh zero-length entry even when the path exists (KERNEL.md
+   K4), so `O_WRONLY|O_CREAT|O_APPEND` would overwrite from offset 0. Emulate
+   append portably: reopen the existing file WITHOUT O_CREAT and seek to its end;
+   only create when it is genuinely absent. On a POSIX kernel this is equivalent
+   to O_APPEND for a single writer. */
+int open_append(char* p)
 {
 	int fd;
-	close(1);
-	fd = open(tmpfile, O_WRONLY | O_TRUNC | HS_O_NOFOLLOW, 384);
-	/* The capture relies on open() landing on the just-freed fd 1 (it returns
-	   the lowest free fd). That holds only if fd 0 is open; if a parent exec'd
-	   hs with stdin closed, open() lands at 0 and stdout would be misdirected --
-	   fail cleanly (caller _exit(1)s) rather than capture to the wrong fd. */
-	if(fd != 1) { if(fd >= 0) close(fd); return -1; }
-	hs_in_fd = 0;
-	hs_out_fd = 1;
-	hs_err_fd = 2;
-	hs_in_path = NULL;
-	hs_out_path = tmpfile;
-	hs_err_path = NULL;
-	g_field_split = TRUE;
-	trap_exit_action = NULL;
+	fd = open(p, O_WRONLY, 0);
+	if(fd < 0) fd = open(p, O_WRONLY | O_CREAT, 420);
+	if(fd >= 0) lseek(fd, 0, SEEK_END);
 	return fd;
 }
 
+/* Capture a command substitution's stdout into a fresh temp file and return its
+   path (the caller reads it back, then unlinks+frees it). The body runs through
+   run_isolated() in this same process -- no fork -- with its stdout redirected
+   to the temp file via hs_out_fd. This is what lets `$(...)` work on the
+   builder-hex0-arch kernels, which cannot fork-without-exec (KERNEL.md K1); it
+   also captures builtins/compounds regardless of which fd open() returns, since
+   hs's stdio wrapper writes through hs_out_fd rather than literal fd 1. (A body
+   that exec's an external still cannot be captured there -- the external writes
+   to fd 1, the console -- but the bootstrap has no externals besides hs.)
+
+   make_cap_tmpfile_path() already created the file with O_CREAT|O_EXCL, so we
+   reopen WITHOUT O_CREAT (avoids the kernel's "O_CREAT always makes a new entry"
+   behaviour, KERNEL.md K4). For `x=$(cmd)` last_status becomes $? (POSIX: an
+   assignment-only command exits with the last substitution's status). */
 char* capture_expr_to_tmpfile(char* expr)
 {
 	char* tmpfile;
-	int child;
-	int status;
+	int fd;
 
 	tmpfile = make_cap_tmpfile_path();
-	child = fork();
-	if(child == 0)
-	{
-		if(cap_child_setup(tmpfile) < 0) _exit(1);
-		expand_and_exec(expr);
-		_exit(last_status);
-	}
-	waitpid(child, &status, 0);
-	/* Record the substitution's exit status. For `x=$(cmd)` it becomes $?
-	   (POSIX: an assignment-only command exits with the last command
-	   substitution's status); for `cmd $(...)` the command's own exec
-	   overwrites it afterward. */
 	g_cmdsub_count = g_cmdsub_count + 1;
-	last_status = wait_status_to_exit(status);
+	fd = open(tmpfile, O_WRONLY | O_TRUNC | HS_O_NOFOLLOW, 384);
+	if(fd < 0) { last_status = 1; return tmpfile; }
+	run_isolated(-1, expr, fd, tmpfile);
+	close(fd);
 	return tmpfile;
 }
 
 char* capture_node_to_tmpfile(int node_idx)
 {
 	char* tmpfile;
-	int child;
-	int status;
+	int fd;
 
 	tmpfile = make_cap_tmpfile_path();
-	child = fork();
-	if(child == 0)
-	{
-		if(cap_child_setup(tmpfile) < 0) _exit(1);
-		exec_node(node_idx);
-		_exit(last_status);
-	}
-	waitpid(child, &status, 0);
+	fd = open(tmpfile, O_WRONLY | O_TRUNC | HS_O_NOFOLLOW, 384);
+	if(fd < 0) return tmpfile;
+	run_isolated(node_idx, NULL, fd, tmpfile);
+	close(fd);
 	return tmpfile;
 }
 
@@ -853,7 +787,16 @@ char* var_get_internal(char* name, int check_nounset)
 			sh_err_puts("hs: ");
 			sh_err_puts(name);
 			sh_err_puts(": unbound variable\n");
-			if(flag_errexit) exit(1);
+			if(flag_errexit)
+			{
+				if(subshell_depth > 0)
+				{
+					g_subshell_exit = TRUE;
+					g_subshell_exit_status = 1;
+					return "";
+				}
+				exit(1);
+			}
 		}
 		return "";
 	}
@@ -4837,18 +4780,29 @@ int builtin_printf(char** argv, int argc)
    1-byte read lands in g_ftbuf (a shared scratch byte) to avoid taking the
    address of a local under M2-Planet.
 
-   path_probe returns the read() result: >= 1 = a non-empty readable file,
-   0 = an empty (or just-opened) readable file, < 0 = opened but unreadable --
-   which for a directory is EISDIR. PROBE_NOOPEN means open() itself failed
-   (a value no read() return can collide with).
+   path_probe returns the read() result: >= 1 = a readable byte is present,
+   0 = opened but no byte (EOF), < 0 = opened but read failed. PROBE_NOOPEN
+   means open() itself failed (a value no read() return can collide with).
 
-   Limits vs a real stat (accepted -- they need stat/lstat we don't have, and
-   don't arise on the small flat filesystems hs targets):
+   TYPE RULE (size-as-type): >= 1 byte readable -> regular file; opened but no
+   readable byte -> directory. The "no byte" case unifies two kernels: a real
+   POSIX kernel returns EISDIR (< 0) when you read a directory, while the
+   builder-hex0-arch bootstrap kernels (see KERNEL.md, finding K2) have no stat,
+   represent a directory as a size-0 entry, and return EOF (== 0) for it -- the
+   same signature as an empty regular file there. Treating BOTH "read < 0" and
+   "read == 0" as a directory makes hs classify directories identically on both,
+   at the documented cost below.
+
+   Limits vs a real stat (accepted -- they need stat/lstat we don't have):
+   - an EMPTY regular file (0 bytes) is reported as a directory (`-d` true, `-f`
+     false) on every kernel. This is deliberate: on a size-0-directory kernel an
+     empty file and a directory are byte-for-byte indistinguishable without
+     stat, so hs picks one rule and applies it everywhere for consistency. The
+     bootstrap convention is "no zero-byte regular files" (directories are made
+     with `src 0 /name`), which makes this exact on those kernels;
    - a file with no read permission can't be opened, so `-f`/`-d` report false
      even though it exists (POSIX uses the inode type regardless of read perm);
-   - a FIFO/socket with no data ready reads -1 (EAGAIN) just as a directory
-     reads -1 (EISDIR), so a waiting FIFO is misreported as a directory; a char
-     device like /dev/null reads 0 (EOF) and is reported as a regular file;
+   - a FIFO/socket with no data ready reads -1 (EAGAIN), like a directory;
    - `-L`/`-h` (symlink) need lstat, so they are always false. */
 #define PROBE_NOOPEN (-1000)
 int path_probe(char* p)
@@ -4864,7 +4818,7 @@ int path_probe(char* p)
 
 int path_is_reg(char* p)
 {
-	if(path_probe(p) >= 0) return TRUE;   /* opened and readable (incl. empty) */
+	if(path_probe(p) >= 1) return TRUE;   /* opened with >= 1 readable byte -> regular file */
 	return FALSE;
 }
 
@@ -4873,8 +4827,9 @@ int path_is_dir(char* p)
 	int r;
 	r = path_probe(p);
 	if(r == PROBE_NOOPEN) return FALSE;   /* couldn't open -> not a directory */
-	if(r < 0) return TRUE;                /* opened but read failed -> directory */
-	return FALSE;
+	if(r >= 1) return FALSE;              /* has a readable byte -> regular file */
+	return TRUE;                          /* opened, no byte (EISDIR < 0, or EOF == 0 on a
+	                                         size-0-directory kernel) -> directory */
 }
 
 /* `-s`: a readable file with at least one byte (read() returns 1 when a byte is
@@ -5524,7 +5479,7 @@ int exec_buffer(char* buf, int len, char* path)
 			}
 		}
 
-		if(fn_return_flag) { free(chunk); break; }
+		if(fn_return_flag || g_subshell_exit) { free(chunk); break; }
 
 		free(chunk);
 		pos = cmd_end;
@@ -5659,7 +5614,7 @@ int is_shell_builtin(char* name)
 	   match(name, "export") || match(name, "set") || match(name, "shift") ||
 	   match(name, "unset") || match(name, "return") || match(name, "break") ||
 	   match(name, "continue") || match(name, "alias") || match(name, "unalias") ||
-	   match(name, "cd") || match(name, "true") || match(name, "false") ||
+	   match(name, "cd") || match(name, "pwd") || match(name, "true") || match(name, "false") ||
 	   match(name, ":") || match(name, ".") || match(name, "source") ||
 	   match(name, "exit") || match(name, "command") || match(name, "typeset") ||
 	   match(name, "trap") || match(name, "type") || match(name, "exec") || match(name, "wait") ||
@@ -5818,6 +5773,16 @@ int exec_builtin(char** argv, int argc)
 	{
 		i = 0;
 		if(argc > 1) i = str_to_int(argv[1]);
+		/* Inside an in-process subshell, `exit` ends the subshell, not the
+		   whole shell: set the unwind flag (checked alongside fn_return_flag in
+		   the exec loops) and let run_isolated() catch it. */
+		if(subshell_depth > 0)
+		{
+			g_subshell_exit = TRUE;
+			g_subshell_exit_status = i;
+			last_status = i;
+			return i;
+		}
 		run_exit_trap();
 		sh_flush(stdout);
 		exit(i);
@@ -5848,7 +5813,11 @@ int exec_builtin(char** argv, int argc)
 		/* `umask [mode]`: with an octal mode, set the file-creation mask;
 		   with none, print it as 4-digit octal. config.guess does
 		   `umask 077` to make a private temp dir, so the set form is what
-		   the bootstrap actually needs. */
+		   the bootstrap actually needs. The minimal kernels have no umask
+		   syscall, so we track the value in g_umask rather than reading it
+		   back via umask(0) (which would return arch-dependent garbage --
+		   see KERNEL.md); umask() is still called so the POSIX host honours
+		   the mask. */
 		if(argc >= 2)
 		{
 			int m;
@@ -5863,14 +5832,14 @@ int exec_builtin(char** argv, int argc)
 				m = m * 8 + (a[di] - '0');
 				di = di + 1;
 			}
+			g_umask = m;
 			umask(m);
 		}
 		else
 		{
 			int m;
 			char* ob;
-			m = umask(0);
-			umask(m);
+			m = g_umask;
 			/* Heap (not a local array): M2-Planet mishandles local arrays. */
 			ob = tmp_alloc(6);
 			ob[0] = '0';
@@ -5929,6 +5898,20 @@ int exec_builtin(char** argv, int argc)
 				return 1;
 			}
 		}
+		last_status = 0;
+		return 0;
+	}
+
+	if(match(cmd, "pwd"))
+	{
+		char* cwd;
+		/* No external `pwd` exists on a minimal bootstrap kernel, so hs reports
+		   the working directory itself via getcwd. */
+		cwd = getcwd(calloc(4096, 1), 4096);
+		if(cwd == NULL) { last_status = 1; return 1; }
+		sh_puts(cwd, stdout);
+		sh_puts("\n", stdout);
+		sh_flush(stdout);
 		last_status = 0;
 		return 0;
 	}
@@ -6264,7 +6247,7 @@ int exec_builtin(char** argv, int argc)
 			   match(name, "export") || match(name, "set") || match(name, "shift") ||
 			   match(name, "unset") || match(name, "return") || match(name, "break") ||
 			   match(name, "continue") || match(name, "alias") || match(name, "unalias") ||
-			   match(name, "cd") || match(name, "true") || match(name, "false") ||
+			   match(name, "cd") || match(name, "pwd") || match(name, "true") || match(name, "false") ||
 			   match(name, ":") || match(name, ".") || match(name, "source") ||
 			   match(name, "exit") || match(name, "command") || match(name, "typeset") ||
 			   match(name, "["))
@@ -6471,12 +6454,6 @@ int exec_simple(int idx)
 	   run (POSIX), so we record the failing path and abort after the loop. */
 	int redir_failed;
 	char* redir_failed_path;
-	/* Child redirect spec for external commands */
-	int* child_kind;
-	char** child_paths;
-	int* child_modes;
-	int* child_replay_fd;
-	int* child_shares_path;
 	/* Heredoc temp files created for this command, unlinked after it runs.
 	   Heap-backed (tmp arena), not a local array: M2-Planet mishandles
 	   local pointer arrays, corrupting the stack frame. */
@@ -6490,15 +6467,9 @@ int exec_simple(int idx)
 	int*   pre_had;
 	int*   pre_exp;
 	int    pre_n;
-	/* Whether this external inherited a shell-level redirected stdout/stderr
-	   (so we re-sync the fd offset to EOF afterward). */
-	int   inherited_out;
-	int   inherited_err;
 
 	heredoc_tmps = tmp_alloc(MAX_HEREDOC * sizeof(char*));
 	heredoc_ntmp = 0;
-	inherited_out = FALSE;
-	inherited_err = FALSE;
 	redir_failed = FALSE;
 	redir_failed_path = NULL;
 	pre_n = 0;
@@ -6605,9 +6576,10 @@ int exec_simple(int idx)
 			}
 		}
 
-		/* Apply redirects for builtins and collect the spec for any
-		 * external child. Parent-side state is purely (int fd, char* path)
-		 * per std stream; no FILE* manipulation. */
+		/* Apply redirects to the shell's own stdio fds (hs_in_fd/out/err) so
+		 * builtins, subshells and pipelines honor them. Externals are never
+		 * redirected -- they inherit the real fds (KERNEL.md). State is purely
+		 * (int fd, char* path) per std stream; no FILE* manipulation. */
 		saved_in_fd = -1;
 		saved_out_fd = -1;
 		saved_err_fd = -1;
@@ -6617,26 +6589,6 @@ int exec_simple(int idx)
 		opened_in = -1;
 		opened_out = -1;
 		opened_err = -1;
-		child_kind = tmp_alloc(3 * sizeof(int));
-		child_paths = tmp_alloc(3 * sizeof(char*));
-		child_modes = tmp_alloc(3 * sizeof(int));
-		child_replay_fd = tmp_alloc(3 * sizeof(int));
-		child_shares_path = tmp_alloc(3 * sizeof(int));
-		child_kind[0] = REDIR_NONE;
-		child_kind[1] = REDIR_NONE;
-		child_kind[2] = REDIR_NONE;
-		child_paths[0] = NULL;
-		child_paths[1] = NULL;
-		child_paths[2] = NULL;
-		child_modes[0] = 0;
-		child_modes[1] = 0;
-		child_modes[2] = 0;
-		child_replay_fd[0] = -1;
-		child_replay_fd[1] = -1;
-		child_replay_fd[2] = -1;
-		child_shares_path[0] = 0;
-		child_shares_path[1] = 0;
-		child_shares_path[2] = 0;
 		if(rc > 0)
 		{
 			/* Redirect targets are a single-word context: an unquoted $var /
@@ -6671,15 +6623,12 @@ int exec_simple(int idx)
 
 					fd = heredoc_body_to_fd(rfile, heredoc_tmps, &heredoc_ntmp, &htmp);
 					if(fd >= 0) redir_install(&hs_in_fd, &hs_in_path, &saved_in_fd, &saved_in_path, &opened_in, fd, htmp);
-					child_kind[0] = REDIR_PATH;
-					child_paths[0] = htmp;
-					child_modes[0] = O_RDONLY;
 				}
 				else if(rfile[0] == '<' && rfile[1] == '&')
 				{
 					/* N<&M input dup (e.g. `<&0`, `exec 7<&0`). Parent-side int
-					   update so builtins read the duped stream; child-side spec
-					   so externals inherit it. Mirrors the `>&` output dup. */
+					   update so builtins read the duped stream. (Externals are
+					   never redirected -- they inherit the real fds.) */
 					int src_m;
 					if(rfd < 0) rfd = 0;
 					src_m = str_to_int(rfile + 2);
@@ -6702,22 +6651,6 @@ int exec_simple(int idx)
 						redir_save(&hs_err_fd, &hs_err_path, &saved_err_fd, &saved_err_path);
 						hs_err_fd = src_fd; hs_err_path = src_path;
 					}
-
-					if(rfd >= 0 && rfd <= 2)
-					{
-						if(src_path != NULL)
-						{
-							child_kind[rfd] = REDIR_PATH;
-							child_paths[rfd] = src_path;
-							child_modes[rfd] = O_RDONLY;
-						}
-						else
-						{
-							/* No known path (inherited terminal/pipe fd): leave
-							   the child's slot so it inherits fd rfd unchanged. */
-							child_kind[rfd] = REDIR_NONE;
-						}
-					}
 				}
 				else if(rfile[0] == '<')
 				{
@@ -6725,27 +6658,18 @@ int exec_simple(int idx)
 					fd = open(rfile, O_RDONLY, 0);
 					if(fd >= 0) redir_install(&hs_in_fd, &hs_in_path, &saved_in_fd, &saved_in_path, &opened_in, fd, rfile);
 					else { redir_failed = TRUE; redir_failed_path = rfile; }
-					child_kind[0] = REDIR_PATH;
-					child_paths[0] = rfile;
-					child_modes[0] = O_RDONLY;
 				}
 				else if(rfile[0] == '>' && rfile[1] == '>')
 				{
 					if(rfd < 0) rfd = 1;
 					rfile = strip_quotes(expand_word(rfile + 2));
-					fd = open(rfile, O_WRONLY | O_CREAT | O_APPEND, 420);
+					fd = open_append(rfile);
 					if(fd >= 0)
 					{
 						if(rfd == 1) redir_install(&hs_out_fd, &hs_out_path, &saved_out_fd, &saved_out_path, &opened_out, fd, rfile);
 						else if(rfd == 2) redir_install(&hs_err_fd, &hs_err_path, &saved_err_fd, &saved_err_path, &opened_err, fd, rfile);
 					}
 					else { redir_failed = TRUE; redir_failed_path = rfile; }
-					if(rfd >= 0 && rfd <= 2)
-					{
-						child_kind[rfd] = REDIR_PATH;
-						child_paths[rfd] = rfile;
-						child_modes[rfd] = O_WRONLY | O_CREAT | O_APPEND;
-					}
 				}
 				else if(rfile[0] == '>')
 				{
@@ -6781,65 +6705,12 @@ int exec_simple(int idx)
 							hs_err_fd = src_fd;
 							hs_err_path = src_path;
 						}
-
-						/* Child-side spec, three cases. */
-						if(rfd >= 0 && rfd <= 2)
-						{
-							if(src_path != NULL)
-							{
-								/* Path-reopen: source file is known. */
-								child_kind[rfd] = REDIR_PATH;
-								child_paths[rfd] = src_path;
-								child_modes[rfd] = O_WRONLY | O_CREAT | O_APPEND;
-							}
-							else if(src_fd == rfd)
-							{
-								/* Inherit-unchanged: child's fd N already
-								 * points to the right target. */
-								child_kind[rfd] = REDIR_NONE;
-							}
-							else
-							{
-								/* Co-capture-and-replay. Both fds open the
-								 * same tmp file with O_APPEND so the kernel
-								 * preserves write ordering; parent reads
-								 * the file back to src_fd after exec. */
-								char* cap_path;
-								cap_path = make_cap_tmpfile_path();
-								child_kind[rfd] = REDIR_CAPTURE;
-								child_paths[rfd] = cap_path;
-								child_modes[rfd] = O_WRONLY | O_CREAT | O_TRUNC | O_APPEND;
-								child_replay_fd[rfd] = src_fd;
-
-								/* Co-capture the source slot too, if it
-								 * was still inherited and shares dest. */
-								if(src_m >= 0 && src_m <= 2)
-								{
-									if(child_kind[src_m] == REDIR_NONE)
-									{
-										int src_m_fd;
-										if(src_m == 1) src_m_fd = hs_out_fd;
-										else src_m_fd = hs_err_fd;
-										if(src_m_fd == src_fd)
-										{
-											child_kind[src_m] = REDIR_CAPTURE;
-											child_paths[src_m] = cap_path;
-											child_modes[src_m] = O_WRONLY | O_CREAT | O_TRUNC | O_APPEND;
-											child_replay_fd[src_m] = src_fd;
-											child_shares_path[src_m] = 1;
-										}
-									}
-								}
-							}
-						}
 					}
 					else
 					{
 						/* Plain `>` truncate: O_TRUNC only (no O_APPEND), matching
 						   exec_redir and POSIX -- a command that seeks backward in
-						   its own stdout must overwrite, not append. (The co-capture
-						   path above keeps O_APPEND on purpose, to preserve write
-						   ordering when two fds share one tmp file.) */
+						   its own stdout must overwrite, not append. */
 						fd = open(rfile, O_WRONLY | O_CREAT | O_TRUNC, 420);
 						if(fd >= 0)
 						{
@@ -6847,12 +6718,6 @@ int exec_simple(int idx)
 							else if(rfd == 2) redir_install(&hs_err_fd, &hs_err_path, &saved_err_fd, &saved_err_path, &opened_err, fd, rfile);
 						}
 						else { redir_failed = TRUE; redir_failed_path = rfile; }
-						if(rfd >= 0 && rfd <= 2)
-						{
-							child_kind[rfd] = REDIR_PATH;
-							child_paths[rfd] = rfile;
-							child_modes[rfd] = O_WRONLY | O_CREAT | O_TRUNC;
-						}
 					}
 				}
 				i = i + 1;
@@ -6872,53 +6737,20 @@ int exec_simple(int idx)
 			goto exec_simple_cleanup;
 		}
 
-		/* Pipe right-side stdin: CMD_PIPE staged a tmp file path here
-		 * for us to consume as if it were `< file`. */
-		if(pending_pipe_stdin_file != NULL)
+		/* Pipe right-side stdin: CMD_PIPE staged a tmp file path here for
+		 * us to consume as if it were `< file`, feeding the right side's
+		 * builtins through hs_in_fd. (An external on the right inherits the
+		 * real stdin and does not read the staged file -- pipelines connect
+		 * builtins; see KERNEL.md.) Skip if an explicit input redirect
+		 * already claimed stdin this command (saved_in_fd >= 0). */
+		if(pending_pipe_stdin_file != NULL && saved_in_fd < 0)
 		{
-			if(child_kind[0] == REDIR_NONE)
-			{
-				char* pif;
-				int pif_fd;
-				pif = pending_pipe_stdin_file;
-				pending_pipe_stdin_file = NULL;
-				pif_fd = open(pif, O_RDONLY, 0);
-				if(pif_fd >= 0) redir_install(&hs_in_fd, &hs_in_path, &saved_in_fd, &saved_in_path, &opened_in, pif_fd, pif);
-				child_kind[0] = REDIR_PATH;
-				child_paths[0] = pif;
-				child_modes[0] = O_RDONLY;
-			}
-		}
-
-		/* Inherit a shell-level redirected stdin for externals that have
-		 * none of their own. This is what makes `myfunc <<EOF` (or
-		 * `myfunc < file`) feed an external like `cat` *inside* the
-		 * function: the outer redirect set hs_in_path, and we turn it into
-		 * the child's fd-0 spec. Builtins already read hs_in_fd directly,
-		 * so this only affects forked externals. */
-		if(child_kind[0] == REDIR_NONE && hs_in_path != NULL)
-		{
-			child_kind[0] = REDIR_PATH;
-			child_paths[0] = hs_in_path;
-			child_modes[0] = O_RDONLY;
-		}
-		/* Likewise inherit a shell-level redirected stdout/stderr (a
-		 * `{ ...; cmd; } > file` block). O_APPEND so the external writes
-		 * after the builtin output we just flushed, instead of truncating
-		 * or overwriting it. */
-		if(child_kind[1] == REDIR_NONE && hs_out_path != NULL)
-		{
-			child_kind[1] = REDIR_PATH;
-			child_paths[1] = hs_out_path;
-			child_modes[1] = O_WRONLY | O_CREAT | O_APPEND;
-			inherited_out = TRUE;
-		}
-		if(child_kind[2] == REDIR_NONE && hs_err_path != NULL)
-		{
-			child_kind[2] = REDIR_PATH;
-			child_paths[2] = hs_err_path;
-			child_modes[2] = O_WRONLY | O_CREAT | O_APPEND;
-			inherited_err = TRUE;
+			char* pif;
+			int pif_fd;
+			pif = pending_pipe_stdin_file;
+			pending_pipe_stdin_file = NULL;
+			pif_fd = open(pif, O_RDONLY, 0);
+			if(pif_fd >= 0) redir_install(&hs_in_fd, &hs_in_path, &saved_in_fd, &saved_in_path, &opened_in, pif_fd, pif);
 		}
 
 		result = exec_builtin(argv, exp_argc);
@@ -7068,48 +6900,57 @@ int exec_simple(int idx)
 			goto exec_simple_cleanup;
 		}
 
-		/* Restore parent stdio state. The child-side spec we already
-		 * built will be applied by exec_external_redir. Keep opened_*
-		 * alive so the child inherits them; parent closes after waitpid. */
+		/* Externals cannot honor a redirect or capture on the target kernels
+		   (fd 0/1/2 are the console, and there is no dup2 -- KERNEL.md K1).
+		   Rather than run the external with the redirect silently ineffective
+		   (an empty `$(extprog)`, an empty `extprog >file`), refuse: a non-NULL
+		   std-stream path means this external's stdin/stdout/stderr is bound to
+		   a file, temp, or pipe it cannot reach -- a direct `>`/`<`/`2>`, a
+		   `$(extprog)`/pipe capture, or an enclosing redirected group / prior
+		   `exec >file`. Builtins and functions are unaffected (they reached this
+		   point only by not being one). See README.md / KERNEL.md. */
+		if(hs_in_path != NULL || hs_out_path != NULL || hs_err_path != NULL)
+		{
+			sh_err_puts("hs: ");
+			sh_err_puts(cmd);
+			sh_err_puts(": cannot redirect or capture an external command (unsupported)\n");
+			last_status = 1;
+			goto exec_simple_cleanup;
+		}
+
+		/* Restore parent stdio state before the external runs. Externals are
+		 * never redirected (they inherit the real fds), so there is no child
+		 * spec to apply -- the parent's hs_*_fd just go back to what they
+		 * were. Keep opened_* alive until the shared cleanup. */
 		if(saved_in_fd >= 0)  { hs_in_fd  = saved_in_fd;  hs_in_path  = saved_in_path;  saved_in_fd  = -1; }
 		if(saved_out_fd >= 0) { hs_out_fd = saved_out_fd; hs_out_path = saved_out_path; saved_out_fd = -1; }
 		if(saved_err_fd >= 0) { hs_err_fd = saved_err_fd; hs_err_path = saved_err_path; saved_err_fd = -1; }
 
 		/* Flush hs's buffered stdout before the external runs: builtins
-		 * write through a FILE* buffer while the external writes the fd
-		 * directly, so without this their output interleaves out of order
-		 * when both go to the same redirected file (e.g. a `{ printf...;
-		 * cmd | sort; } > file` block). */
+		 * write through a FILE* buffer, so without this their output would
+		 * interleave out of order with the external's console output. */
 		sh_flush(stdout);
 
-		/* Take the redir path if any slot is non-NONE. */
 		{
-			int use_redir;
-			use_redir = 0;
-			if(rc > 0) use_redir = 1;
-			if(child_kind[0] != REDIR_NONE) use_redir = 1;
-			if(child_kind[1] != REDIR_NONE) use_redir = 1;
-			if(child_kind[2] != REDIR_NONE) use_redir = 1;
-			if(use_redir != 0)
+			int cap_held;
+			/* When we are inside a builtin capture (stdout points at a writable
+			   temp fd, e.g. a `$()` or pipe-left context), the parent must not
+			   hold that fd open across the external's fork: some kernels'
+			   continuation-fork crashes with a live writable temp fd
+			   (KERNEL.md K1). Close it first, reopen-append after, so later
+			   builtin output in the same context is still captured. The
+			   external's own output goes to the console regardless. */
+			cap_held = -1;
+			if(hs_out_path != NULL && hs_out_fd >= 3)
 			{
-				last_status = exec_external_redir(pathbuf, argv, envp,
-				                                  child_kind, child_paths,
-				                                  child_modes, child_replay_fd,
-				                                  child_shares_path);
+				cap_held = hs_out_fd;
+				close(hs_out_fd);
 			}
-			else
-			{
-				last_status = exec_external(pathbuf, argv, envp);
-			}
-		}
 
-		/* The external appended to our redirected stdout/stderr via its own
-		   fd, leaving our fd's offset stale; re-sync to EOF so a later
-		   builtin write in the same block doesn't overwrite that output.
-		   M2libc provides lseek (and SEEK_END via stdio.h) on every arch, so
-		   this works identically under M2-Planet and a hosted libc. */
-		if(inherited_out) lseek(hs_out_fd, 0, SEEK_END);
-		if(inherited_err) lseek(hs_err_fd, 0, SEEK_END);
+			last_status = exec_external(pathbuf, argv, envp);
+
+			if(cap_held >= 0) hs_out_fd = open_append(hs_out_path);
+		}
 
 		/* Fall through to the shared cleanup (also the `goto` target for the
 		   builtin / function / command-not-found paths). The external path
@@ -7266,7 +7107,7 @@ int exec_redir(int idx)
 		{
 			if(rfd < 0) rfd = 1;
 			p = strip_quotes(expand_word(rfile + 2));
-			fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 420);
+			fd = open_append(p);
 			if(fd >= 0)
 			{
 				if(rfd == 2) redir_install(&hs_err_fd, &hs_err_path, &saved_err_fd, &saved_err_path, &opened_err, fd, p);
@@ -7349,6 +7190,92 @@ int exec_redir(int idx)
 	return result;
 }
 
+/* Run a subshell body -- a `( )` group, a `$( )`/backtick capture, or a pipe
+   stage -- IN THE SAME PROCESS, isolating its side effects, instead of forking.
+   The builder-hex0-arch kernels corrupt a parent that forks and exits without
+   execve (KERNEL.md K1), so hs cannot use fork-without-exec for subshells.
+
+   Exactly one of node_idx (>= 0) or expr (non-NULL) selects the body. If
+   out_fd >= 0 the body's stdout is redirected to it (the capture temp file),
+   with out_path tracked for `2>&1` path-reopen.
+
+   Isolation, restored on return: variables (in_subshell routes every var_set
+   through lsc, lsc_pop rewinds them), the fd/path redirection state, the working
+   directory (getcwd/chdir), field splitting, and the EXIT trap (reset in a
+   subshell). An `exit` inside the body sets g_subshell_exit, which the exec
+   loops treat like a return and which we convert here into the body's status. */
+int run_isolated(int node_idx, char* expr, int out_fd, char* out_path)
+{
+	int result;
+	int s_out_fd; char* s_out_path;
+	int s_in_fd;  char* s_in_path;
+	int s_err_fd; char* s_err_path;
+	char* s_trap;
+	int s_field_split;
+	int s_sub_exit;
+	int s_sub_status;
+	int s_errexit;
+	int s_nounset;
+	int s_suppress;
+	int s_andor;
+	char* s_cwd;
+
+	sh_flush(stdout);
+
+	s_out_fd = hs_out_fd; s_out_path = hs_out_path;
+	s_in_fd = hs_in_fd;   s_in_path = hs_in_path;
+	s_err_fd = hs_err_fd; s_err_path = hs_err_path;
+	s_trap = trap_exit_action;
+	s_field_split = g_field_split;
+	s_sub_exit = g_subshell_exit;
+	s_sub_status = g_subshell_exit_status;
+	/* `set` options are inherited by the subshell, but its changes must not leak
+	   back (POSIX: `(set -e)` does not turn on errexit for the parent). The
+	   errexit-suppression / short-circuit state is per-construct, so the body
+	   starts those fresh. */
+	s_errexit = flag_errexit;
+	s_nounset = flag_nounset;
+	s_suppress = suppress_errexit;
+	s_andor = g_andor_shortcircuit;
+	s_cwd = getcwd(calloc(4096, 1), 4096);
+
+	lsc_push();
+	in_subshell = in_subshell + 1;
+	subshell_depth = subshell_depth + 1;
+	trap_exit_action = NULL;
+	g_subshell_exit = FALSE;
+	suppress_errexit = 0;
+	g_andor_shortcircuit = FALSE;
+
+	if(out_fd >= 0) { hs_out_fd = out_fd; hs_out_path = out_path; g_field_split = TRUE; }
+
+	if(expr != NULL) result = expand_and_exec(expr);
+	else result = exec_node(node_idx);
+	sh_flush(stdout);
+
+	if(g_subshell_exit) result = g_subshell_exit_status;
+
+	subshell_depth = subshell_depth - 1;
+	in_subshell = in_subshell - 1;
+	lsc_pop();
+
+	if(s_cwd != NULL) chdir(s_cwd);
+	hs_out_fd = s_out_fd; hs_out_path = s_out_path;
+	hs_in_fd = s_in_fd;   hs_in_path = s_in_path;
+	hs_err_fd = s_err_fd; hs_err_path = s_err_path;
+	trap_exit_action = s_trap;
+	g_field_split = s_field_split;
+	g_subshell_exit = s_sub_exit;
+	g_subshell_exit_status = s_sub_status;
+	flag_errexit = s_errexit;
+	flag_nounset = s_nounset;
+	suppress_errexit = s_suppress;
+	g_andor_shortcircuit = s_andor;
+
+	last_status = result;
+	return result;
+}
+
 int exec_node(int idx)
 {
 	int type;
@@ -7375,7 +7302,7 @@ int exec_node(int idx)
 		sh_err_puts("\n");
 		return 1;
 	}
-	if(fn_return_flag) return last_status;
+	if(fn_return_flag || g_subshell_exit) return last_status;
 	if(loop_break_level > 0) return last_status;
 
 	type = nd_type[idx];
@@ -7392,10 +7319,16 @@ int exec_node(int idx)
 	if(type == CMD_LIST)
 	{
 		result = exec_node(nd_a[idx]);
-		if(fn_return_flag || loop_break_level > 0 || loop_continue_flag) return result;
+		if(fn_return_flag || g_subshell_exit || loop_break_level > 0 || loop_continue_flag) return result;
 		/* A failed non-final `&&`/`||` operand is exempt (g_andor_shortcircuit). */
 		if(flag_errexit && !suppress_errexit && result != 0 && !g_andor_shortcircuit)
 		{
+			if(subshell_depth > 0)
+			{
+				g_subshell_exit = TRUE;
+				g_subshell_exit_status = result;
+				return result;
+			}
 			exit(result);
 		}
 		result = exec_node(nd_b[idx]);
@@ -7519,7 +7452,7 @@ int exec_node(int idx)
 			if(result != 0) break;
 			body_status = exec_node(nd_b[idx]);
 			result = body_status;
-			if(fn_return_flag) break;
+			if(fn_return_flag || g_subshell_exit) break;
 			if(loop_break_level > 0)
 			{
 				loop_break_level = loop_break_level - 1;
@@ -7573,7 +7506,7 @@ int exec_node(int idx)
 		{
 			var_set(nd_str[idx], word_list[wi]);
 			result = exec_node(nd_a[idx]);
-			if(fn_return_flag) break;
+			if(fn_return_flag || g_subshell_exit) break;
 			if(loop_break_level > 0)
 			{
 				loop_break_level = loop_break_level - 1;
@@ -7652,37 +7585,14 @@ int exec_node(int idx)
 
 	if(type == CMD_SUBSH)
 	{
-		/* A subshell `( ... )` runs in a forked child so its state changes
-		   -- variable assignments, `cd`, `set`, redirections -- stay
-		   isolated from the parent. (configure's PATH_SEPARATOR probe,
-		   `(PATH='/bin;/bin'; ...)`, depends on this; without it the bogus
-		   PATH leaks and every later tool lookup fails.) */
-		int sub_child;
-		int sub_status;
-
-		sh_flush(stdout);
-		sub_child = fork();
-		if(sub_child == 0)
-		{
-			/* A subshell does not run the parent's EXIT trap when it exits
-			   (POSIX resets caught traps in a subshell). Clearing it here
-			   keeps an inner `exit`/`as_fn_error` -- e.g. autoconf's failing
-			   compile probes inside `( ... )` -- from firing the parent's
-			   `trap '... rm -f confdefs* ...' 0` and wiping shared files. */
-			trap_exit_action = NULL;
-			result = exec_node(nd_a[idx]);
-			sh_flush(stdout);
-			_exit(result & 255);
-		}
-		if(sub_child < 0)
-		{
-			/* fork failed: fall back to in-process (no isolation). */
-			result = exec_node(nd_a[idx]);
-			last_status = result;
-			return last_status;
-		}
-		waitpid(sub_child, &sub_status, 0);
-		last_status = wait_status_to_exit(sub_status);
+		/* A subshell `( ... )` runs in-process via run_isolated so its state
+		   changes -- variable assignments, `cd`, `set`, redirections, the EXIT
+		   trap, and an inner `exit` -- stay isolated from the parent, without a
+		   fork-without-exec the bootstrap kernels can't survive (KERNEL.md K1).
+		   (configure's PATH_SEPARATOR probe, `(PATH='/bin;/bin'; ...)`, depends
+		   on this; without it the bogus PATH leaks and every later tool lookup
+		   fails.) */
+		last_status = run_isolated(nd_a[idx], NULL, -1, NULL);
 		return last_status;
 	}
 
@@ -7700,6 +7610,14 @@ int main(int argc, char** argv, char** envp)
 
 	tmp_init();
 	perm_init(8388608);
+
+	/* Seed the tracked file-creation mask to a conventional 022 and apply it,
+	   so the value `umask` reports is truthful on the POSIX host too (the
+	   minimal kernels have no umask syscall to read back -- see KERNEL.md).
+	   M2-Planet has no octal literals: 18 == 022. */
+	g_umask = 18;
+	umask(g_umask);
+
 	lex_stack_src = calloc(LEX_STACK_MAX, sizeof(char*));
 	lex_stack_pos = calloc(LEX_STACK_MAX, sizeof(int));
 	lex_stack_len = calloc(LEX_STACK_MAX, sizeof(int));

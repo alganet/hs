@@ -92,9 +92,6 @@ tests/expansion/long_token.sh
 tests/expansion/cmd_subst_dollar.sh
 tests/expansion/cmd_subst_multi.sh
 tests/expansion/cmd_subst_nested.sh
-tests/expansion/cmd_subst_external.sh
-tests/expansion/cmd_subst_external_multi.sh
-tests/expansion/cmd_subst_external_assign.sh
 tests/expansion/pattern_escape_strip.sh
 
 # --- quoting ---
@@ -115,16 +112,12 @@ tests/redirection/stderr_redirect.sh
 tests/redirection/multiple_redirs.sh
 tests/redirection/redir_in_loop.sh
 tests/redirection/pipeline_basic.sh
-tests/redirection/pipeline_external_left.sh
 tests/redirection/dup_builtin_merge.sh
 tests/redirection/dup_pipe_merge.sh
 tests/redirection/stdout_to_stderr.sh
 tests/redirection/stderr_only.sh
 tests/redirection/append_and_dup.sh
 tests/redirection/dup_trap_form.sh
-tests/redirection/dup_external_merge.sh
-tests/redirection/dup_external_trap.sh
-tests/redirection/group_pipe_resync.sh
 tests/redirection/redir_target_split.sh
 tests/redirection/fd_redirect_spacing.sh
 tests/redirection/input_dup.sh
@@ -183,7 +176,6 @@ tests/heredoc/escapes.sh
 tests/heredoc/dash_strip.sh
 tests/heredoc/dash_strip_literal.sh
 tests/heredoc/multi.sh
-tests/heredoc/pipe.sh
 tests/heredoc/redirect_combo.sh
 tests/heredoc/in_for.sh
 tests/heredoc/in_if.sh

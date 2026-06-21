@@ -80,3 +80,60 @@ jobs:
           ASAN_OPTIONS: abort_on_error=1:halt_on_error=1:detect_leaks=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ./build/hs-san tests/run.sh --target ./build/hs-san
+
+  # Boot a builder-hex0-arch kernel under QEMU, bootstrap a native stage0
+  # toolchain inside it, compile hs there, and run the probe sweep (KERNEL.md).
+  # x86 boots as an MBR under x86_64 (KVM if the runner offers /dev/kvm, else
+  # TCG); riscv64/aarch64 boot the virt kernels under TCG (slow).
+  kernel:
+    name: kernel (${{ matrix.arch }}/${{ matrix.board }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Boots a real minimal kernel, bootstraps stage0, compiles hs there, and runs
+    # the probe sweep. hs adapts to these kernels' divergences (see KERNEL.md).
+    # All three arches are hard gates: every probe must pass. (aarch64 was briefly
+    # allowed to fail while its stage2 fork save-area bug -- which hung on nested
+    # fork+exec -- was fixed in builder-hex0-arch; that is resolved, so it gates too.)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            board: bios
+            qemu_pkg: qemu-system-x86
+          - arch: riscv64
+            board: virt
+            qemu_pkg: qemu-system-misc
+          - arch: aarch64
+            board: virt
+            qemu_pkg: qemu-system-arm
+    steps:
+      - name: Checkout hs
+        uses: actions/checkout@v4
+
+      - name: Checkout builder-hex0-arch
+        uses: actions/checkout@v4
+        with:
+          repository: alganet/builder-hex0-arch
+          path: builder-hex0-arch
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.qemu_pkg }}
+
+      - name: Cache stage0-posix sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            stage0-posix-1.9.1
+            stage0-posix-1.9.1.tar.gz
+          key: stage0-posix-1.9.1-src
+
+      - name: Boot kernel, build hs, run probe sweep
+        env:
+          ARCH: ${{ matrix.arch }}
+          BOARD: ${{ matrix.board }}
+          BUILDER: ${{ github.workspace }}/builder-hex0-arch
+          QEMU_TIMEOUT: "6600"
+        run: sh tests/kernel/run.sh

@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Alexandre Gomes Gaigalas <alganet@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# In-kernel master driver (run by kaem-optional-seed, cwd = /).
+# Bootstraps a native 32-bit x86 stage0 toolchain from seeds, builds hs (strict),
+# then runs the probe sweep (non-strict; probe.hs absorbs hard failures).
+# The mini chain yields M2-Planet/blood-elf/M1/hex2/kaem; full/extra is skipped.
+
+./bootstrap-seeds/POSIX/x86/kaem-optional-seed ./x86/mescc-tools-seed-kaem.kaem
+./x86/artifact/kaem-0 ./x86/mescc-tools-mini-kaem.kaem
+./x86/bin/kaem --verbose --strict --file ./build.kaem
+./x86/bin/kaem --verbose --file ./probe.kaem
