@@ -100,7 +100,7 @@ run_one_test() {
 
     _fail=""
 
-    if [ ! -f "$_gold_out" ]; then
+    if [ ! -e "$_gold_out" ]; then
         _fail="missing golden .out"
     else
         cmp -s "$out_file" "$_gold_out"

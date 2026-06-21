@@ -1,7 +1,6 @@
 x=world
-cat <<EOF
+while IFS= read -r __l; do printf "%s\n" "$__l"; done <<EOF
 a=`echo HELLO`
-b=`printf "%s\n" "HAVE_dirent.h" | sed "y%.%_%"`
 c=$(echo $x)
 d=\`literal\`
 e=`echo one; echo two`

@@ -1,5 +1,5 @@
 if true; then
-cat <<EOF
+while IFS= read -r __l; do printf "%s\n" "$__l"; done <<EOF
 inside if branch
 EOF
 fi

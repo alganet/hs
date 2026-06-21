@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Alexandre Gomes Gaigalas <alganet@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# In-kernel master driver (run by kaem-optional-seed, cwd = /).
+# Bootstraps a native riscv64 stage0 toolchain from seeds, then builds and
+# tests hs. The "mini" chain alone yields M2-Planet/blood-elf/M1/hex2/kaem;
+# the heavier full/extra rebuild is intentionally skipped.
+
+./bootstrap-seeds/POSIX/riscv64/kaem-optional-seed ./riscv64/mescc-tools-seed-kaem.kaem
+./riscv64/artifact/kaem-0 ./riscv64/mescc-tools-mini-kaem.kaem
+./riscv64/bin/kaem --verbose --strict --file ./build.kaem
+./riscv64/bin/kaem --verbose --file ./probe.kaem

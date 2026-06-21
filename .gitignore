@@ -4,3 +4,4 @@
 
 /build/
 stage0-posix*
+/tests/kernel/out/

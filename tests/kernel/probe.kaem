@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 Alexandre Gomes Gaigalas <alganet@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Run the master probe runner. kaem aborts on any non-zero child, so the per-
+# case isolation (and absorbing of hard failures) lives in probe.hs, which
+# always exits 0. A single boot thus surfaces every probe outcome.
+
+./hs ./probe.hs

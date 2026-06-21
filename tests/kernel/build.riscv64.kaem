@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2026 Alexandre Gomes Gaigalas <alganet@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Build hs with the just-bootstrapped native riscv64 stage0 toolchain.
+# Mirrors build.sh's M2-Planet pipeline. Run by the full kaem under --strict,
+# so a tool failure aborts the run (a build break is not a kernel finding).
+
+echo ==> M2-Planet: compiling hs.c
+./riscv64/artifact/M2 --architecture riscv64 \
+	-f ./M2libc/sys/types.h \
+	-f ./M2libc/stddef.h \
+	-f ./M2libc/riscv64/linux/fcntl.c \
+	-f ./M2libc/fcntl.c \
+	-f ./M2libc/sys/utsname.h \
+	-f ./M2libc/riscv64/linux/unistd.c \
+	-f ./M2libc/riscv64/linux/sys/stat.c \
+	-f ./M2libc/ctype.c \
+	-f ./M2libc/stdlib.c \
+	-f ./M2libc/stdarg.h \
+	-f ./M2libc/stdio.h \
+	-f ./M2libc/stdio.c \
+	-f ./M2libc/string.c \
+	-f ./M2libc/bootstrappable.c \
+	-f ./hs.c \
+	--debug \
+	-o ./hs.M1
+
+echo ==> blood-elf: generating debug stubs
+./riscv64/artifact/blood-elf-0 --64 --little-endian -f ./hs.M1 -o ./hs-footer.M1
+
+echo ==> M1: assembling
+./riscv64/bin/M1 --architecture riscv64 --little-endian \
+	-f ./M2libc/riscv64/riscv64_defs.M1 \
+	-f ./M2libc/riscv64/libc-full.M1 \
+	-f ./hs.M1 \
+	-f ./hs-footer.M1 \
+	-o ./hs.hex2
+
+echo ==> hex2: linking
+./riscv64/bin/hex2 --architecture riscv64 --little-endian --base-address 0x00600000 \
+	-f ./M2libc/riscv64/ELF-riscv64-debug.hex2 \
+	-f ./hs.hex2 \
+	-o ./hs
+
+echo ==> Built hs
